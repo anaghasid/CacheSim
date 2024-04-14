@@ -17,6 +17,7 @@ typedef char byte;
 enum CacheState { MODIFIED, EXCLUSIVE, SHARED, INVALID };
 
 enum BusState {
+  INIT,   // means nothing, just an initializing state
   READ_RQ,  // read request to a cache block requested by another processor that
             // does not already have the block
   READ_RES, // one for read response
@@ -105,7 +106,16 @@ mail send_read_message(cache cacheline, int sender, int addr) {
   return mailbox;
 }
 
-mail read_bus_msg(int thread_num, mail *mail) { return mail[thread_num]; }
+mail read_bus_msg(int thread_num, mail *m) {
+  mail res;
+  res.sender = m[thread_num].sender;
+  res.address = m[thread_num].address;
+  res.value = m[thread_num].value;
+  res.message = m[thread_num].message;
+  res.sender_state = m[thread_num].sender_state;
+  res.done = m[thread_num].done;
+  return res;
+}
 
 void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
                          int cache_size) {
@@ -116,17 +126,17 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
     mailbox = read_bus_msg(thread_num, mailboxes);
     pthread_mutex_unlock(&mailboxes[thread_num].lock);
 
+    // stop this thread when the cache sends a message to its own mailbox to stop
+    if (mailbox.message == STOP_THREAD) {
+      printf("Stopping thread\n");
+      break;
+    }
+    
     // if no new message, wait for sometime
-    if (mailbox.done == 1) {
+    else if (mailbox.done == 1) {
       // printf("No new message, sleeping\n");
       sleep(SLEEP_TIME);
       continue;
-    }
-    // stop this thread when the cache sends a message to its own mailbox to
-    // stop
-    else if (mailbox.message == STOP_THREAD) {
-      printf("Stopping thread\n");
-      break;
     }
 
     // READ REQUEST TO THIS CACHE
@@ -146,6 +156,7 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
           mailboxes[thread_num].done = 1;
           continue;
         }
+        *(c+hash) = cacheline;
 
         // now find the cache that requested it and write to its mailbox
         int sender = mailbox.sender;
@@ -157,6 +168,7 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
         mailboxes[sender].message = READ_RES;
         mailboxes[sender].done = 0;
         pthread_mutex_unlock(&mailboxes[sender].lock);
+        mailboxes[thread_num].done = 1;
       }
 
       else {
@@ -196,11 +208,12 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
       cacheline.address = mailbox.address;
       cacheline.value = mailbox.value;
       cacheline.state = SHARED;
+      *(c + hash) = cacheline;
       pthread_mutex_lock(&mailboxes[thread_num].lock);
       mailboxes[thread_num].done = 1;
       pthread_mutex_unlock(&mailboxes[thread_num].lock);
       printf("read response to thread %d, value = %d and done=%d\n", thread_num,
-             mailbox.value, mailboxes[thread_num].done);
+             mailbox.value, mailbox.done);
       continue;
       // UNLOCK THE CACHELINE?
     } else {
@@ -358,8 +371,7 @@ void cpu_loop(int num_threads) {
                 // broadcast read message
                 for (int i = 0; i < cache_size; i++) {
                   if (i != thread_num) {
-                    mail request =
-                        send_read_message(cacheline, thread_num, inst.address);
+                    mail request = send_read_message(cacheline, thread_num, inst.address);
                     pthread_mutex_lock(&mailboxes[i].lock);
                     mailboxes[i] = request;
                     pthread_mutex_unlock(&mailboxes[i].lock);
@@ -371,6 +383,7 @@ void cpu_loop(int num_threads) {
                 // seconds)
 
                 sleep(SLEEP_TIME + 0.1);
+                cacheline = *(c + hash);
                 if (cacheline.state != SHARED) {
                   // this means no other cache has it
                   // read from memory
@@ -461,11 +474,4 @@ int main(int c, char *argv[]) {
         }
     }
 }
-*/
-
-// Read Input file
-/* // OR
-char filename[15];
-sprintf(filename, "input_%d.txt", omp_get_thread_num());
-FILE * inst_file = fopen(filename, "r");
 */

@@ -8,8 +8,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#define SLEEP_TIME 0.2
+
+/* some changes to the original design:
+- changing all byte to int`
+*/
 typedef char byte;
-enum CacheState { INVALID, SHARED, EXCLUSIVE, MODIFIED };
+enum CacheState { MODIFIED, EXCLUSIVE, SHARED, INVALID };
 
 enum BusState {
   READ_RQ,  // read request to a cache block requested by another processor that
@@ -35,8 +40,8 @@ struct decoded_inst {
 struct mail {
   // write cacheline here instead?
   int sender;
-  byte address;
-  byte value;
+  int address;
+  int value;
   enum CacheState sender_state;
   enum BusState message;
   bool done;
@@ -55,7 +60,7 @@ typedef struct decoded_inst decoded;
  * - WR <address> <val>
  */
 
-byte *memory;
+int *memory;
 
 // Decode instruction lines
 decoded decode_inst_line(char *buffer) {
@@ -89,10 +94,10 @@ void print_cachelines(cache *c, int cache_size) {
   }
 }
 
-mail send_read_message(cache cacheline, int sender) {
+mail send_read_message(cache cacheline, int sender, int addr) {
   mail mailbox;
   mailbox.sender = sender;
-  mailbox.address = cacheline.address;
+  mailbox.address = addr;
   mailbox.value = -1;
   mailbox.message = READ_RQ;
   mailbox.sender_state = INVALID;
@@ -102,30 +107,33 @@ mail send_read_message(cache cacheline, int sender) {
 
 mail read_bus_msg(int thread_num, mail *mail) { return mail[thread_num]; }
 
-void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c,
-                         byte *memory, int cache_size) {
-  // does not handle read responses because that will be done in the executing
-  // thread
+void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
+                         int cache_size) {
+  mail mailbox;
   while (1) {
     // ACQUIRE LOCK
-    mail mailbox;
     pthread_mutex_lock(&mailboxes[thread_num].lock);
     mailbox = read_bus_msg(thread_num, mailboxes);
     pthread_mutex_unlock(&mailboxes[thread_num].lock);
 
+    // if no new message, wait for sometime
+    if (mailbox.done == 1) {
+      // printf("No new message, sleeping\n");
+      sleep(SLEEP_TIME);
+      continue;
+    }
     // stop this thread when the cache sends a message to its own mailbox to
     // stop
-    if (mailbox.message == STOP_THREAD) {
+    else if (mailbox.message == STOP_THREAD) {
       printf("Stopping thread\n");
       break;
     }
-    // if no new message, wait for sometime
-    else if (mailbox.done == 1) {
-      sleep(0.002);
-      continue;
-    }
 
+    // READ REQUEST TO THIS CACHE
     else if (mailbox.message == READ_RQ) {
+      // other cache wants to read from this
+      // printf("message for thread %d : address %d, state %d\n",
+      // thread_num, mailbox.address, mailbox.message);
       int hash = mailbox.address % cache_size;
       cache cacheline = *(c + hash);
       if (cacheline.address == mailbox.address) {
@@ -134,7 +142,8 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c,
           cacheline.state = SHARED;
         }
 
-        if (cacheline.state == INVALID) {
+        else if (cacheline.state == INVALID) {
+          mailboxes[thread_num].done = 1;
           continue;
         }
 
@@ -149,33 +158,57 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c,
         mailboxes[sender].done = 0;
         pthread_mutex_unlock(&mailboxes[sender].lock);
       }
+
+      else {
+        // didn't find requested copoy in local cache, move on
+        mailboxes[thread_num].done = 1;
+      }
     }
 
+    // INVALIDATE MESSAGE TO THIS CACHE
     else if (mailbox.message == READX) {
       // other cache is trying to invalidate your value
+      // printf("message for thread %d : address %d, state %d and done %d\n",
+      // thread_num, mailbox.address, mailbox.message, mailbox.done);
       int hash = mailbox.address % cache_size;
       cache cacheline = *(c + hash);
+
       if (cacheline.address == mailbox.address) {
         // found the requested copy in the cache
-        if (cacheline.state == MODIFIED) {
+        printf("Found copy of %d in thread %d cache\n", cacheline.address,
+               thread_num);
+        if (cacheline.state == MODIFIED || cacheline.state == SHARED) {
+          // write to memory so the previous state is preserved
           *(memory + cacheline.address) = cacheline.value;
-          cacheline.state = INVALID;
         }
-
-        else {
-          cacheline.state = INVALID;
-        }
+        cacheline.state = INVALID;
       }
-    } else if (mailbox.message == READ_RES) {
+      pthread_mutex_lock(&mailboxes[thread_num].lock);
+      mailboxes[thread_num].done = 1;
+      pthread_mutex_unlock(&mailboxes[thread_num].lock);
+    }
+
+    else if (mailbox.message == READ_RES) {
       int hash = mailbox.address % cache_size;
+
       // LOCK THE CACHELINE?
       cache cacheline = *(c + hash);
       cacheline.address = mailbox.address;
       cacheline.value = mailbox.value;
       cacheline.state = SHARED;
+      pthread_mutex_lock(&mailboxes[thread_num].lock);
+      mailboxes[thread_num].done = 1;
+      pthread_mutex_unlock(&mailboxes[thread_num].lock);
+      printf("read response to thread %d, value = %d and done=%d\n", thread_num,
+             mailbox.value, mailboxes[thread_num].done);
+      continue;
       // UNLOCK THE CACHELINE?
+    } else {
     }
-    sleep(0.002);
+    // printf("Got message from bus to %d for address %d\n", thread_num,
+    // mailbox.address);
+
+    sleep(SLEEP_TIME);
   }
 }
 
@@ -184,6 +217,8 @@ void cpu_loop(int num_threads) {
   // Initialize a CPU level cache that holds about 2 bytes of data.
   mail *mailboxes = (mail *)malloc(sizeof(mail) * num_threads);
   for (int i = 0; i < num_threads; i++) {
+    mailboxes[i].address = 0;
+    mailboxes[i].done = 1;
     pthread_mutex_init(&mailboxes[i].lock, NULL);
   }
 
@@ -206,7 +241,6 @@ void cpu_loop(int num_threads) {
           char filename[15];
           sprintf(filename, "input_%d.txt", thread_num);
           FILE *inst_file = fopen(filename, "r");
-          // FILE* inst_file = fopen(("input_%d.txt",thread_num), "r");
 
           char inst_line[20];
           // Decode instructions and execute them.
@@ -214,8 +248,8 @@ void cpu_loop(int num_threads) {
             decoded inst = decode_inst_line(inst_line);
             int hash = inst.address % cache_size;
             cache cacheline = *(c + hash);
-            // print_cachelines(c, cache_size);
-            // printf("\n");
+            // printf("type %s on address %d\n", inst.type ? "RD" : "WR",
+            // inst.address);
 
             if (cacheline.address == inst.address) {
               if (inst.type == 0) {
@@ -223,17 +257,19 @@ void cpu_loop(int num_threads) {
                 if (cacheline.state == MODIFIED ||
                     cacheline.state == EXCLUSIVE || cacheline.state == SHARED) {
                   // printf("Reading from address %d: %d\n", cacheline.address,
-                  // cacheline.value);
-                  // printf("Read hit for %d\n", inst.address);
+                  // cacheline.value); printf("Read hit for %d\n",
+                  // inst.address);
                 }
 
                 // READ MISS
                 else {
                   // broadcast read message
                   // printf("Read miss for %d\n", inst.address);
+                  *(memory + cacheline.address) = cacheline.value;
                   for (int i = 0; i < cache_size; i++) {
                     if (i != thread_num) {
-                      mail request = send_read_message(cacheline, thread_num);
+                      mail request = send_read_message(cacheline, thread_num,
+                                                       inst.address);
                       pthread_mutex_lock(&mailboxes[i].lock);
                       mailboxes[i] = request;
                       pthread_mutex_unlock(&mailboxes[i].lock);
@@ -244,17 +280,17 @@ void cpu_loop(int num_threads) {
                   // handle_bus_messages() but if no cache has it (check after 2
                   // seconds)
 
-                  sleep(2);
+                  sleep(SLEEP_TIME + 0.1);
                   if (cacheline.state != SHARED) {
                     // this means no other cache has it
                     // read from memory
+                    cacheline.address = inst.address;
                     cacheline.value = *(memory + cacheline.address);
                     cacheline.state = EXCLUSIVE;
                   }
                 }
                 // printf("Reading from address %d: %d\n", cacheline.address,
                 // cacheline.value);
-
               }
 
               else {
@@ -262,6 +298,7 @@ void cpu_loop(int num_threads) {
                 // printf("Write hit for %d\n", inst.address);
 
                 if (cacheline.state == MODIFIED) {
+                  *(memory + cacheline.address) = cacheline.value;
                   cacheline.value = inst.value;
                 }
 
@@ -287,14 +324,13 @@ void cpu_loop(int num_threads) {
                 }
 
                 else {
-                  // WRITE MISS
+                  // WRITE MISS - address there in cache but invalid
                   // printf("Write miss for %d\n", inst.address);
 
-                  // broadcast invalidate message to all other caches
                   for (int i = 0; i < num_threads; i++) {
                     if (i != thread_num) {
                       pthread_mutex_lock(&mailboxes[i].lock);
-                      mailboxes[i].address = cacheline.address;
+                      mailboxes[i].address = inst.address;
                       mailboxes[i].value = -1;
                       mailboxes[i].sender_state = MODIFIED;
                       mailboxes[i].sender = thread_num;
@@ -303,6 +339,10 @@ void cpu_loop(int num_threads) {
                       pthread_mutex_unlock(&mailboxes[i].lock);
                     }
                   }
+
+                  *(memory + cacheline.address) =
+                      cacheline
+                          .value; // put whatever you're replacing into memory
                   cacheline.address = inst.address;
                   cacheline.value = inst.value;
                   cacheline.state = MODIFIED;
@@ -312,12 +352,14 @@ void cpu_loop(int num_threads) {
 
             else {
               // READ MISS
+              *(memory + cacheline.address) = cacheline.value;
               if (inst.type == 0) {
-                printf("This is a read miss\n");
+                // printf("This is a read miss\n");
                 // broadcast read message
                 for (int i = 0; i < cache_size; i++) {
                   if (i != thread_num) {
-                    mail request = send_read_message(cacheline, thread_num);
+                    mail request =
+                        send_read_message(cacheline, thread_num, inst.address);
                     pthread_mutex_lock(&mailboxes[i].lock);
                     mailboxes[i] = request;
                     pthread_mutex_unlock(&mailboxes[i].lock);
@@ -328,7 +370,7 @@ void cpu_loop(int num_threads) {
                 // handle_bus_messages() but if no cache has it (check after 2
                 // seconds)
 
-                sleep(2);
+                sleep(SLEEP_TIME + 0.1);
                 if (cacheline.state != SHARED) {
                   // this means no other cache has it
                   // read from memory
@@ -344,7 +386,7 @@ void cpu_loop(int num_threads) {
                 for (int i = 0; i < num_threads; i++) {
                   if (i != thread_num) {
                     pthread_mutex_lock(&mailboxes[i].lock);
-                    mailboxes[i].address = cacheline.address;
+                    mailboxes[i].address = inst.address;
                     mailboxes[i].value = -1;
                     mailboxes[i].sender_state = MODIFIED;
                     mailboxes[i].sender = thread_num;
@@ -354,6 +396,7 @@ void cpu_loop(int num_threads) {
                   }
                 }
                 // printf("Modifying cacheline\n");
+                *(memory + cacheline.address) = cacheline.value;
                 cacheline.address = inst.address;
                 cacheline.value = inst.value;
                 cacheline.state = MODIFIED;
@@ -362,11 +405,13 @@ void cpu_loop(int num_threads) {
             }
             // printf("Writing to address %d: %d\n", cacheline.address,
             // cacheline.value);
-            printf("Thread %d: %s %d: %d\n", thread_num,
+            printf("Thread %d: %s %d: %d state = %d\n", thread_num,
                    inst.type == 0 ? "RD" : "WR", cacheline.address,
-                   cacheline.value);
+                   cacheline.value, cacheline.state);
             *(c + hash) = cacheline;
           }
+
+          sleep(2);
           pthread_mutex_lock(&mailboxes[thread_num].lock);
           mailboxes[thread_num].message = STOP_THREAD;
           pthread_mutex_unlock(&mailboxes[thread_num].lock);
@@ -376,7 +421,6 @@ void cpu_loop(int num_threads) {
 #pragma omp section
         {
           int thread_num = omp_get_ancestor_thread_num(1);
-
           handle_msg_from_bus(thread_num, mailboxes, c, memory, cache_size);
         }
       }
@@ -388,7 +432,7 @@ int main(int c, char *argv[]) {
   // Initialize Global memory
   // Let's assume the memory module holds about 24 bytes of data.
   int memory_size = 24;
-  memory = (byte *)malloc(sizeof(byte) * memory_size);
+  memory = (int *)malloc(sizeof(int) * memory_size);
   cpu_loop(2);
   free(memory);
 }

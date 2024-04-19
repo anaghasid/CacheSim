@@ -143,8 +143,6 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
     // READ REQUEST TO THIS CACHE
     else if (mailbox.message == READ_RQ) {
       // other cache wants to read from this
-      // printf("message for thread %d : address %d, state %d\n",
-      // thread_num, mailbox.address, mailbox.message);
       int hash = mailbox.address % cache_size;
       cache cacheline = *(c + hash);
       if (cacheline.address == mailbox.address) {
@@ -184,16 +182,13 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
       int hash = mailbox.address % cache_size;
       cache cacheline = *(c + hash);
 
-      printf("Received invalidate from %d to %d for %d\n",mailbox.sender, thread_num, mailbox.address);
       if (cacheline.address == mailbox.address) {
         // found the requested copy in the cache
-        printf("Found copy of %d in thread %d cache\n", cacheline.address,
-               thread_num);
         if (cacheline.state == MODIFIED || cacheline.state == SHARED) {
           // write to memory so the previous state is preserved
           *(memory + cacheline.address) = cacheline.value;
         }
-        printf("invalidating thread %d for %d\n", thread_num, cacheline.address);
+        // printf("invalidating thread %d for %d\n", thread_num, cacheline.address);
         cacheline.state = INVALID;
         *(c+hash) = cacheline;
       }
@@ -213,18 +208,32 @@ void handle_msg_from_bus(int thread_num, mail *mailboxes, cache *c, int *memory,
       pthread_mutex_lock(&mailboxes[thread_num].lock);
       mailboxes[thread_num].done = 1;
       pthread_mutex_unlock(&mailboxes[thread_num].lock);
-      printf("read response to thread %d, value = %d and done=%d\n", thread_num,
-             mailbox.value, mailbox.done);
       continue;
     } 
     else {
     }
-    // printf("Got message from bus to %d for address %d\n", thread_num,
-    // mailbox.address);
+    // printf("Got message from bus to %d for address %d\n", thread_num, mailbox.address);
 
     sleep(SLEEP_TIME);
   }
 }
+
+
+void send_invalidate_message(int num_threads, int sender, int address, mail* mailboxes) {
+  for (int i = 0; i < num_threads; i++) {
+    if (i != sender) {
+      pthread_mutex_lock(&mailboxes[i].lock);
+      mailboxes[i].address = address;
+      mailboxes[i].value = -1;
+      mailboxes[i].sender_state = MODIFIED;
+      mailboxes[i].sender = sender;
+      mailboxes[i].message = READX;
+      mailboxes[i].done = 0;
+      pthread_mutex_unlock(&mailboxes[i].lock);
+    }
+  }
+}
+
 
 // This function implements the mock CPU loop that reads and writes data.
 void cpu_loop(int num_threads) {
@@ -255,13 +264,15 @@ void cpu_loop(int num_threads) {
 #pragma omp section
         {
           int thread_num = omp_get_ancestor_thread_num(1);
-          printf("Executing thread number %d\n", thread_num);
+          // printf("Executing thread number %d\n", thread_num);
 
           char filename[15];
           sprintf(filename, "input_%d.txt", thread_num);
           FILE *inst_file = fopen(filename, "r");
 
           char inst_line[20];
+
+
           // Decode instructions and execute them.
           while (fgets(inst_line, sizeof(inst_line), inst_file)) {
             decoded inst = decode_inst_line(inst_line);
@@ -275,10 +286,7 @@ void cpu_loop(int num_threads) {
                 // READ HIT
                 if (cacheline.state == MODIFIED ||
                     cacheline.state == EXCLUSIVE || cacheline.state == SHARED) {
-                  // printf("Reading from address %d: %d\n", cacheline.address,
-                  // cacheline.value);
-                  //  printf("Read hit for %d\n",
-                  // inst.address);
+
                 }
 
                 // READ MISS
@@ -296,7 +304,7 @@ void cpu_loop(int num_threads) {
                   }
 
                   // when the response is sent by another cache it is read in
-                  // handle_bus_messages() but if no cache has it (check after 2 seconds)
+                  // handle_bus_messages() but if no cache has it (check after 0.2 seconds)
 
                   sleep(SLEEP_TIME + 0.2);
                   cacheline = *(c+hash);
@@ -326,28 +334,15 @@ void cpu_loop(int num_threads) {
                   cacheline.state = MODIFIED;
                 }
              
-                else {
+                // else {
                   // write miss because address there in cache but invalid
                   // printf("Write miss for %d\n", inst.address);
-
-                  for (int i = 0; i < num_threads; i++) {
-                    if (i != thread_num) {
-                      pthread_mutex_lock(&mailboxes[i].lock);
-                      mailboxes[i].address = inst.address;
-                      mailboxes[i].value = -1;
-                      mailboxes[i].sender_state = MODIFIED;
-                      mailboxes[i].sender = thread_num;
-                      mailboxes[i].message = READX;
-                      mailboxes[i].done = 0;
-                      pthread_mutex_unlock(&mailboxes[i].lock);
-                    }
-                  }
-
+                  send_invalidate_message(num_threads, thread_num, inst.address, mailboxes);
                   
                   cacheline.address = inst.address;
                   cacheline.value = inst.value;
                   cacheline.state = MODIFIED;
-                }
+                // }
 
                 *(c+hash) = cacheline;
               }
@@ -387,21 +382,10 @@ void cpu_loop(int num_threads) {
               // WRITE MISS
               else {
                 // printf("This is a write miss\n");
-                for (int i = 0; i < num_threads; i++) {
-                  if (i != thread_num) {
-                    pthread_mutex_lock(&mailboxes[i].lock);
-                    mailboxes[i].address = inst.address;
-                    mailboxes[i].value = -1;
-                    mailboxes[i].sender_state = MODIFIED;
-                    mailboxes[i].sender = thread_num;
-                    mailboxes[i].message = READX;
-                    mailboxes[i].done = 0;
-                    pthread_mutex_unlock(&mailboxes[i].lock);
-                  }
-                }
-                if(cacheline.state==MODIFIED || cacheline.state ==SHARED) {
+                send_invalidate_message(num_threads, thread_num, inst.address, mailboxes);
+                if(cacheline.state==MODIFIED || cacheline.state == SHARED) {
                     *(memory + cacheline.address) = cacheline.value; // put whatever you're replacing into memory
-                  }
+                }
                 cacheline.address = inst.address;
                 cacheline.value = inst.value;
                 cacheline.state = MODIFIED;
@@ -414,9 +398,9 @@ void cpu_loop(int num_threads) {
                    cacheline.value, cacheline.state);
             *(c + hash) = cacheline;
           }
-          sleep(4);
-          printf("After execution of thread %d:\n",thread_num);
-          print_cachelines(c, cache_size, thread_num);
+          sleep(6);
+          // printf("After execution of thread %d:\n",thread_num);
+          // print_cachelines(c, cache_size, thread_num);
           pthread_mutex_lock(&mailboxes[thread_num].lock);
           mailboxes[thread_num].message = STOP_THREAD;
           pthread_mutex_unlock(&mailboxes[thread_num].lock);
@@ -438,7 +422,7 @@ int main(int c, char *argv[]) {
   // Let's assume the memory module holds about 24 bytes of data.
   int memory_size = 24;
   memory = (int *)malloc(sizeof(int) * memory_size);
-  cpu_loop(4);
+  cpu_loop(2);
   free(memory);
 }
 
@@ -448,20 +432,14 @@ int main(int c, char *argv[]) {
 {
     #pragma omp parallel num_threads(2) shared(bus)
     {
-        // bus shared inside one cache and its bus access
         #pragma omp section
         {
             //cache read write
-
-            #pragma omp critical
-            send_to_bus()
+            // write to bus / mailbox
         }
         #pragma omp section
         {
             // bus snooping
-            // when to stop this?
-
-            // while
 
         }
     }

@@ -393,9 +393,8 @@ void cpu_loop(int num_threads) {
               }
             }
 
-            printf("Thread %d: %s %d: %d state = %d\n", thread_num,
-                   inst.type == 0 ? "RD" : "WR", cacheline.address,
-                   cacheline.value, cacheline.state);
+            printf("Thread %d: %s %d: %d\n", thread_num,
+                   inst.type == 0 ? "RD" : "WR", cacheline.address, cacheline.value);
             *(c + hash) = cacheline;
           }
           sleep(6);
